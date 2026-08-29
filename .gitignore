@@ -1,0 +1,5 @@
+.DS_Store
+voice_fx
+build/
+*.o
+*.d
