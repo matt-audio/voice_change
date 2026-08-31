@@ -1,11 +1,14 @@
 #include "pitched_voice.h"
 
 #include <math.h>
-#include <rubberband/rubberband-c.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef VC_PITCHED_VOICE_PROFILE
 #include <time.h>
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
 
 #define PITCHED_VOICE_MAX_FILTERS (PITCHED_VOICE_MAX_PEAKS + 2)
@@ -15,6 +18,9 @@
 #define PITCHED_VOICE_RESAMPLE_TAPS 97
 #define PITCHED_VOICE_CHORUS_SIZE 512
 #define PITCHED_VOICE_CHORUS_MASK (PITCHED_VOICE_CHORUS_SIZE - 1)
+#define PITCHED_VOICE_PV_FRAME_SIZE 512
+#define PITCHED_VOICE_PV_HOP_SIZE 128
+#define PITCHED_VOICE_PV_BIN_COUNT (PITCHED_VOICE_PV_FRAME_SIZE / 2 + 1)
 
 /* 2.8 kHz low-pass at 48 kHz, Kaiser beta 7, -72 dB at 4 kHz. */
 static const float k_resample_coefficients[PITCHED_VOICE_RESAMPLE_TAPS] = {
@@ -66,6 +72,8 @@ _Static_assert(PITCHED_VOICE_SHIFT_BLOCK_SIZE *
 _Static_assert((PITCHED_VOICE_CHORUS_SIZE &
                 (PITCHED_VOICE_CHORUS_SIZE - 1)) == 0,
                "chorus delay size must be a power of two");
+_Static_assert(PITCHED_VOICE_SHIFT_BLOCK_SIZE % PITCHED_VOICE_PV_HOP_SIZE == 0,
+               "pitch block must contain whole phase-vocoder hops");
 
 typedef struct {
     float envelope;
@@ -80,11 +88,25 @@ typedef struct {
 } PitchedVoiceDynamics;
 
 struct PitchedVoiceState {
-    RubberBandState shifter;
     unsigned int pitch_sample_rate_divisor;
+    float pitch_ratio;
     float shift_input[PITCHED_VOICE_SHIFT_BLOCK_SIZE];
     float shift_output[PITCHED_VOICE_SHIFT_BLOCK_SIZE];
     size_t shift_input_fill;
+    float pv_input[PITCHED_VOICE_PV_FRAME_SIZE];
+    float pv_window[PITCHED_VOICE_PV_FRAME_SIZE];
+    float pv_ola[PITCHED_VOICE_PV_FRAME_SIZE];
+    float pv_weights[PITCHED_VOICE_PV_FRAME_SIZE];
+    DspComplex pv_fft[PITCHED_VOICE_PV_FRAME_SIZE];
+    float pv_magnitudes[PITCHED_VOICE_PV_BIN_COUNT];
+    float pv_input_phases[PITCHED_VOICE_PV_BIN_COUNT];
+    float pv_frequencies[PITCHED_VOICE_PV_BIN_COUNT];
+    float pv_previous_phases[PITCHED_VOICE_PV_BIN_COUNT];
+    float pv_output_phases[PITCHED_VOICE_PV_BIN_COUNT];
+    float pv_output_magnitudes[PITCHED_VOICE_PV_BIN_COUNT];
+    float pv_base_phases[PITCHED_VOICE_PV_BIN_COUNT];
+    size_t pv_frames;
+    int pv_phase_ready;
     float downsample_history[2 * PITCHED_VOICE_RESAMPLE_TAPS];
     size_t downsample_write;
     unsigned int downsample_phase;
@@ -93,7 +115,6 @@ struct PitchedVoiceState {
     float output_fifo[PITCHED_VOICE_OUTPUT_FIFO_SIZE];
     size_t output_fifo_read;
     size_t output_fifo_count;
-    size_t startup_discard;
 
     DspBiquad filters[PITCHED_VOICE_MAX_FILTERS];
     size_t filter_count;
@@ -307,67 +328,192 @@ static void pitched_voice_chorus_block(PitchedVoiceState *state,
     }
 }
 
-static int pitched_voice_drain_shifter(PitchedVoiceState *state) {
-    float *outputs[1] = { state->shift_output };
-    for (;;) {
-        PITCHED_PROFILE_START(retrieve_start);
-        int available = rubberband_available(state->shifter);
-        if (available <= 0) {
-            PITCHED_PROFILE_ADD(pitch_shift_seconds, retrieve_start);
-            return available == 0;
-        }
-        size_t requested = (size_t)available < PITCHED_VOICE_SHIFT_BLOCK_SIZE
-            ? (size_t)available : PITCHED_VOICE_SHIFT_BLOCK_SIZE;
-        size_t retrieved = rubberband_retrieve(state->shifter, outputs,
-                                                (unsigned int)requested);
-        PITCHED_PROFILE_ADD(pitch_shift_seconds, retrieve_start);
-        if (retrieved == 0) return 0;
-        size_t start = 0;
-        if (state->startup_discard > 0) {
-            size_t discard = state->startup_discard < retrieved
-                ? state->startup_discard : retrieved;
-            state->startup_discard -= discard;
-            start = discard;
-        }
-        size_t count = retrieved - start;
-        size_t output_count = count * state->pitch_sample_rate_divisor;
-        if (output_count >
-            PITCHED_VOICE_OUTPUT_FIFO_SIZE - state->output_fifo_count) return 0;
-        if (state->chorus_mix > 0.0f) {
-            PITCHED_PROFILE_START(chorus_start);
-            pitched_voice_chorus_block(
-                state, state->shift_output, start, retrieved);
-            PITCHED_PROFILE_ADD(chorus_seconds, chorus_start);
-        }
-        PITCHED_PROFILE_START(output_push_start);
-        for (size_t i = start; i < retrieved; ++i) {
-            float sample = state->shift_output[i];
-            if (state->pitch_sample_rate_divisor == 1) {
-                if (!pitched_voice_fifo_push(state, sample))
-                    return 0;
-            } else if (!pitched_voice_upsample_push(
-                           state, sample)) {
-                return 0;
-            }
-        }
-        PITCHED_PROFILE_ADD(output_push_seconds, output_push_start);
-    }
+static float pitched_voice_wrap_phase(float phase) {
+    const float two_pi = 2.0f * (float)M_PI;
+    return phase - two_pi * roundf(phase / two_pi);
 }
 
-static int pitched_voice_process_block(PitchedVoiceState *state,
-                                       const float input[], size_t count) {
-    const float *inputs[1] = { input };
-    PITCHED_PROFILE_START(process_start);
-    rubberband_process(state->shifter, inputs, (unsigned int)count, 0);
-    PITCHED_PROFILE_ADD(pitch_shift_seconds, process_start);
-    return pitched_voice_drain_shifter(state);
+static void pitched_voice_vocoder_frame(PitchedVoiceState *state,
+                                         const float input[], float output[]) {
+    const float two_pi = 2.0f * (float)M_PI;
+    const float bin_scale = two_pi / (float)PITCHED_VOICE_PV_FRAME_SIZE;
+    const float hop = (float)PITCHED_VOICE_PV_HOP_SIZE;
+    memmove(state->pv_input,
+            state->pv_input + PITCHED_VOICE_PV_HOP_SIZE,
+            (PITCHED_VOICE_PV_FRAME_SIZE - PITCHED_VOICE_PV_HOP_SIZE) *
+                sizeof(*state->pv_input));
+    memcpy(state->pv_input +
+               (PITCHED_VOICE_PV_FRAME_SIZE - PITCHED_VOICE_PV_HOP_SIZE),
+           input, PITCHED_VOICE_PV_HOP_SIZE * sizeof(*input));
+
+    double energy = 0.0;
+    for (size_t i = 0; i < PITCHED_VOICE_PV_FRAME_SIZE; ++i) {
+        float sample = state->pv_input[i];
+        energy += (double)sample * sample;
+        state->pv_fft[i] = (DspComplex){sample * state->pv_window[i], 0.0f};
+    }
+
+    if (energy > 1e-12) {
+        dsp_fft(state->pv_fft, PITCHED_VOICE_PV_FRAME_SIZE, 0);
+        for (size_t bin = 0; bin < PITCHED_VOICE_PV_BIN_COUNT; ++bin) {
+            float real = state->pv_fft[bin].r;
+            float imaginary = state->pv_fft[bin].i;
+            float phase = atan2f(imaginary, real);
+            state->pv_magnitudes[bin] = hypotf(real, imaginary);
+            state->pv_input_phases[bin] = phase;
+            float omega = bin_scale * (float)bin;
+            if (state->pv_phase_ready) {
+                float delta = phase - state->pv_previous_phases[bin] -
+                    omega * hop;
+                omega += pitched_voice_wrap_phase(delta) / hop;
+            }
+            state->pv_previous_phases[bin] = phase;
+            state->pv_frequencies[bin] = omega;
+        }
+
+        memset(state->pv_fft, 0, sizeof(state->pv_fft));
+        memset(state->pv_output_magnitudes, 0,
+               sizeof(state->pv_output_magnitudes));
+        size_t mapped_bins = 0;
+        for (size_t target = 0; target < PITCHED_VOICE_PV_BIN_COUNT;
+             ++target) {
+            float source = (float)target / state->pitch_ratio;
+            if (source > PITCHED_VOICE_PV_BIN_COUNT - 1) break;
+            size_t left = (size_t)source;
+            size_t right = left + 1 < PITCHED_VOICE_PV_BIN_COUNT
+                ? left + 1 : left;
+            float fraction = source - (float)left;
+            float magnitude = state->pv_magnitudes[left] +
+                (state->pv_magnitudes[right] -
+                 state->pv_magnitudes[left]) * fraction;
+            float frequency = state->pv_frequencies[left] +
+                (state->pv_frequencies[right] -
+                 state->pv_frequencies[left]) * fraction;
+            float phase_delta = pitched_voice_wrap_phase(
+                state->pv_input_phases[right] -
+                state->pv_input_phases[left]);
+            state->pv_base_phases[target] =
+                state->pv_input_phases[left] + phase_delta * fraction;
+            state->pv_output_magnitudes[target] = magnitude;
+            if (!state->pv_phase_ready) {
+                state->pv_output_phases[target] =
+                    state->pv_base_phases[target];
+            } else {
+                state->pv_output_phases[target] = pitched_voice_wrap_phase(
+                    state->pv_output_phases[target] +
+                    frequency * state->pitch_ratio * hop);
+            }
+            mapped_bins = target + 1;
+        }
+
+        size_t peaks[PITCHED_VOICE_PV_BIN_COUNT];
+        size_t peak_count = 0;
+        for (size_t bin = 1; bin + 1 < mapped_bins; ++bin) {
+            if (state->pv_output_magnitudes[bin] >=
+                    state->pv_output_magnitudes[bin - 1] &&
+                state->pv_output_magnitudes[bin] >
+                    state->pv_output_magnitudes[bin + 1]) {
+                peaks[peak_count++] = bin;
+            }
+        }
+        size_t peak_cursor = 0;
+        for (size_t target = 0; target < mapped_bins; ++target) {
+            float phase = state->pv_output_phases[target];
+            if (state->pitch_ratio < 1.75f && peak_count > 0 && target > 0 &&
+                target < PITCHED_VOICE_PV_FRAME_SIZE / 2) {
+                while (peak_cursor + 1 < peak_count &&
+                       peaks[peak_cursor + 1] <= target) {
+                    ++peak_cursor;
+                }
+                size_t nearest = peaks[peak_cursor];
+                if (peak_cursor + 1 < peak_count &&
+                    peaks[peak_cursor + 1] - target <
+                    (target > nearest ? target - nearest : nearest - target)) {
+                    nearest = peaks[peak_cursor + 1];
+                }
+                size_t distance = target > nearest
+                    ? target - nearest : nearest - target;
+                if (distance <= 4) {
+                    phase = state->pv_output_phases[nearest] +
+                        pitched_voice_wrap_phase(
+                            state->pv_base_phases[target] -
+                            state->pv_base_phases[nearest]);
+                }
+            }
+            float magnitude = state->pv_output_magnitudes[target];
+            DspComplex value = {
+                magnitude * cosf(phase), magnitude * sinf(phase)};
+            if (target == 0 ||
+                target == PITCHED_VOICE_PV_FRAME_SIZE / 2) {
+                value.i = 0.0f;
+            }
+            state->pv_fft[target] = value;
+            if (target > 0 && target < PITCHED_VOICE_PV_FRAME_SIZE / 2)
+                state->pv_fft[PITCHED_VOICE_PV_FRAME_SIZE - target] =
+                    (DspComplex){value.r, -value.i};
+        }
+        state->pv_phase_ready = 1;
+        dsp_fft(state->pv_fft, PITCHED_VOICE_PV_FRAME_SIZE, 1);
+    } else {
+        memset(state->pv_fft, 0, sizeof(state->pv_fft));
+        state->pv_phase_ready = 0;
+    }
+
+    for (size_t i = 0; i < PITCHED_VOICE_PV_FRAME_SIZE; ++i) {
+        float window = state->pv_window[i];
+        state->pv_ola[i] += state->pv_fft[i].r * window;
+        state->pv_weights[i] += window * window;
+    }
+    ++state->pv_frames;
+    for (size_t i = 0; i < PITCHED_VOICE_PV_HOP_SIZE; ++i) {
+        output[i] = state->pv_frames >= 4 && state->pv_weights[i] > 1e-3f
+            ? state->pv_ola[i] / state->pv_weights[i] : 0.0f;
+    }
+    memmove(state->pv_ola,
+            state->pv_ola + PITCHED_VOICE_PV_HOP_SIZE,
+            (PITCHED_VOICE_PV_FRAME_SIZE - PITCHED_VOICE_PV_HOP_SIZE) *
+                sizeof(*state->pv_ola));
+    memmove(state->pv_weights,
+            state->pv_weights + PITCHED_VOICE_PV_HOP_SIZE,
+            (PITCHED_VOICE_PV_FRAME_SIZE - PITCHED_VOICE_PV_HOP_SIZE) *
+                sizeof(*state->pv_weights));
+    memset(state->pv_ola +
+               (PITCHED_VOICE_PV_FRAME_SIZE - PITCHED_VOICE_PV_HOP_SIZE),
+           0, PITCHED_VOICE_PV_HOP_SIZE * sizeof(*state->pv_ola));
+    memset(state->pv_weights +
+               (PITCHED_VOICE_PV_FRAME_SIZE - PITCHED_VOICE_PV_HOP_SIZE),
+           0, PITCHED_VOICE_PV_HOP_SIZE * sizeof(*state->pv_weights));
 }
 
 static int pitched_voice_shift_block(PitchedVoiceState *state) {
-    int ok = pitched_voice_process_block(
-        state, state->shift_input, PITCHED_VOICE_SHIFT_BLOCK_SIZE);
+    if (PITCHED_VOICE_SHIFT_BLOCK_SIZE * state->pitch_sample_rate_divisor >
+        PITCHED_VOICE_OUTPUT_FIFO_SIZE - state->output_fifo_count) return 0;
+    PITCHED_PROFILE_START(process_start);
+    for (size_t offset = 0; offset < PITCHED_VOICE_SHIFT_BLOCK_SIZE;
+         offset += PITCHED_VOICE_PV_HOP_SIZE) {
+        pitched_voice_vocoder_frame(
+            state, state->shift_input + offset, state->shift_output + offset);
+    }
+    PITCHED_PROFILE_ADD(pitch_shift_seconds, process_start);
+
+    if (state->chorus_mix > 0.0f) {
+        PITCHED_PROFILE_START(chorus_start);
+        pitched_voice_chorus_block(
+            state, state->shift_output, 0, PITCHED_VOICE_SHIFT_BLOCK_SIZE);
+        PITCHED_PROFILE_ADD(chorus_seconds, chorus_start);
+    }
+    PITCHED_PROFILE_START(output_push_start);
+    for (size_t i = 0; i < PITCHED_VOICE_SHIFT_BLOCK_SIZE; ++i) {
+        float sample = state->shift_output[i];
+        if (state->pitch_sample_rate_divisor == 1) {
+            if (!pitched_voice_fifo_push(state, sample)) return 0;
+        } else if (!pitched_voice_upsample_push(state, sample)) {
+            return 0;
+        }
+    }
+    PITCHED_PROFILE_ADD(output_push_seconds, output_push_start);
     ++state->profile.shift_blocks;
-    return ok;
+    return 1;
 }
 
 PitchedVoiceState *pitched_voice_init(int sample_rate,
@@ -381,36 +527,11 @@ PitchedVoiceState *pitched_voice_init(int sample_rate,
     state->pitch_sample_rate_divisor = config->rate ==
         PITCHED_VOICE_RATE_LOW_CPU ? PITCHED_VOICE_RATE_LOW_CPU :
         PITCHED_VOICE_RATE_FULL;
-    RubberBandOptions options = RubberBandOptionProcessRealTime |
-        RubberBandOptionEngineFaster |
-        RubberBandOptionPitchHighSpeed |
-        RubberBandOptionTransientsSmooth |
-        RubberBandOptionDetectorSoft |
-        RubberBandOptionThreadingNever |
-        RubberBandOptionWindowStandard |
-        RubberBandOptionFormantShifted;
+    state->pitch_ratio = config->pitch_ratio;
     unsigned int pitch_sample_rate = (unsigned int)sample_rate /
         state->pitch_sample_rate_divisor;
-    state->shifter = rubberband_new(pitch_sample_rate, 1, options, 1.0,
-                                    config->pitch_ratio);
-    if (!state->shifter) {
-        free(state);
-        return NULL;
-    }
-    rubberband_set_max_process_size(state->shifter,
-                                    PITCHED_VOICE_SHIFT_BLOCK_SIZE);
-    state->startup_discard = rubberband_get_start_delay(state->shifter);
-    size_t startup_padding = rubberband_get_preferred_start_pad(state->shifter);
-    float silence[PITCHED_VOICE_SHIFT_BLOCK_SIZE] = {0.0f};
-    while (startup_padding > 0) {
-        size_t count = startup_padding < PITCHED_VOICE_SHIFT_BLOCK_SIZE
-            ? startup_padding : PITCHED_VOICE_SHIFT_BLOCK_SIZE;
-        if (!pitched_voice_process_block(state, silence, count)) {
-            pitched_voice_free(state);
-            return NULL;
-        }
-        startup_padding -= count;
-    }
+    for (size_t i = 0; i < PITCHED_VOICE_PV_FRAME_SIZE; ++i)
+        state->pv_window[i] = dsp_hann(i, PITCHED_VOICE_PV_FRAME_SIZE);
     state->tremolo_increment = config->tremolo_hz / sample_rate;
     state->tremolo_depth = config->tremolo_depth;
     state->chorus_phase_increment =
@@ -449,8 +570,6 @@ PitchedVoiceState *pitched_voice_init(int sample_rate,
 }
 
 void pitched_voice_free(PitchedVoiceState *state) {
-    if (!state) return;
-    if (state->shifter) rubberband_delete(state->shifter);
     free(state);
 }
 

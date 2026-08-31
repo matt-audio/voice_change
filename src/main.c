@@ -488,7 +488,7 @@ static int run_pitched_mode(const char *mode_name,
     print_profile_stage("setup", setup_seconds, total_seconds);
     print_profile_stage("WAV read", wav_read_seconds, total_seconds);
 #ifdef VC_PITCHED_VOICE_PROFILE
-    print_profile_stage("Rubber Band R2", profile.pitch_shift_seconds,
+    print_profile_stage("phase vocoder", profile.pitch_shift_seconds,
                         dsp_seconds);
     print_profile_stage("chorus", profile.chorus_seconds, dsp_seconds);
     print_profile_stage("upsample + FIFO push", profile.output_push_seconds,
