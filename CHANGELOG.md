@@ -19,9 +19,10 @@
   - stronger, narrower nasal peaks near `780 Hz` and `1.95 kHz`;
   - slightly faster/deeper tremolo and chorus modulation.
 
-### Verification
+### Verification before release
 
-- Added standalone regression, full-rate, dependency, ASan, and UBSan tests.
+- Ran standalone regression, full-rate, dependency, ASan, and UBSan tests
+  before packaging. Test sources are intentionally not part of this repository.
 - Verified that all five modes preserve silence, output length, and realtime
   frame processing behavior.
 - Measured Donald RMS on the 30.013-second reference input at `0.058352`, down

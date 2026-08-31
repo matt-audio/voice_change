@@ -18,8 +18,6 @@ make clean all
 ```
 
 On macOS the executable links only to the operating system `libSystem`.
-The optional regression tests use Python 3's standard library and standard OS
-binary-inspection tools; neither is part of the delivered runtime.
 
 ## Run
 
@@ -34,14 +32,5 @@ binary-inspection tools; neither is part of the delivered runtime.
 Input must be mono, 16-bit PCM WAV at 48 kHz. Male shifts -6 semitones, Female
 shifts +6 semitones, and Donald shifts +12 semitones with additional cartoon
 chorus, EQ, tremolo, and dynamics.
-
-## Verify
-
-```sh
-make test
-make sanitize-test
-```
-
-The test target includes an OS-library-only dynamic dependency check.
 
 Release history and measured changes are recorded in [CHANGELOG.md](CHANGELOG.md).

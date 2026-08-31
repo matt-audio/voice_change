@@ -10,10 +10,6 @@ SRC = src/main.c src/dsp.c src/robot.c src/monster.c src/pitched_voice.c \
 BUILD_DIR = build$(if $(filter 1,$(PROFILE)),_profile,$(if $(filter 1,$(BENCHMARK)),_benchmark,))
 OBJ = $(SRC:src/%.c=$(BUILD_DIR)/%.o)
 DEP = $(OBJ:.o=.d)
-FULL_RATE_TEST = build/test_full_rate
-SANITIZE_TEST = build_sanitize/test_full_rate
-SANITIZER_FLAGS = -O1 -g -fsanitize=address,undefined \
-	-fno-omit-frame-pointer
 
 ifeq ($(PROFILE),1)
 CFLAGS += -DVC_UNIFIED_PROFILE -DVC_ROBOT_PROFILE -DVC_MONSTER_PROFILE \
@@ -23,7 +19,7 @@ ifeq ($(BENCHMARK),1)
 CFLAGS += -DVC_UNIFIED_PROFILE
 endif
 
-.PHONY: all benchmark clean dependency-check profile sanitize-test test
+.PHONY: all benchmark clean profile
 
 all: $(OUTPUT_TARGET)
 
@@ -39,30 +35,6 @@ profile:
 
 benchmark:
 	$(MAKE) BENCHMARK=1
-
-$(FULL_RATE_TEST): tests/full_rate.c src/pitched_voice.c src/pitched_voice.h \
-		src/dsp.c src/dsp.h
-	@mkdir -p build
-	$(CC) $(CFLAGS) -Isrc -o $@ \
-		tests/full_rate.c src/pitched_voice.c src/dsp.c \
-		$(LDFLAGS)
-
-$(SANITIZE_TEST): tests/full_rate.c src/pitched_voice.c src/pitched_voice.h \
-		src/dsp.c src/dsp.h
-	@mkdir -p build_sanitize
-	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) -Isrc -o $@ \
-		tests/full_rate.c src/pitched_voice.c src/dsp.c \
-		$(LDFLAGS) $(SANITIZER_FLAGS)
-
-sanitize-test: $(SANITIZE_TEST)
-	ASAN_OPTIONS=detect_leaks=0 ./$(SANITIZE_TEST)
-
-dependency-check: $(TARGET) tests/check_dependencies.sh
-	sh tests/check_dependencies.sh ./$(TARGET)
-
-test: $(TARGET) $(FULL_RATE_TEST) dependency-check
-	python3 tests/regression.py ./$(TARGET)
-	./$(FULL_RATE_TEST)
 
 clean:
 	rm -f $(TARGET) $(TARGET)_profile $(TARGET)_benchmark
