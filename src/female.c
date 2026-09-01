@@ -3,7 +3,7 @@
 FemaleState *female_init(int sample_rate) {
     static const PitchedVoiceConfig config = {
         .pitch_ratio = 1.414213562f,
-        .rate = PITCHED_VOICE_RATE_LOW_CPU,
+        .rate = PITCHED_VOICE_RATE_WIDEBAND,
         .highpass_hz = 120.0f,
         .peaks = {
             {250.0f, 1.0f, -3.0f},

@@ -3,7 +3,7 @@
 DonaldState *donald_init(int sample_rate) {
     static const PitchedVoiceConfig config = {
         .pitch_ratio = 2.0f,
-        .rate = PITCHED_VOICE_RATE_LOW_CPU,
+        .rate = PITCHED_VOICE_RATE_WIDEBAND,
         .highpass_hz = 200.0f,
         .peaks = {
             {780.0f, 1.35f, 10.0f},

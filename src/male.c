@@ -3,7 +3,7 @@
 MaleState *male_init(int sample_rate) {
     static const PitchedVoiceConfig config = {
         .pitch_ratio = 0.707106781f,
-        .rate = PITCHED_VOICE_RATE_LOW_CPU,
+        .rate = PITCHED_VOICE_RATE_WIDEBAND,
         .highpass_hz = 55.0f,
         .peaks = {
             {130.0f, 0.9f, 5.5f},

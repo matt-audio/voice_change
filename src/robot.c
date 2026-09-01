@@ -178,7 +178,8 @@ static int robot_process_ready(RobotState *state,
     ROBOT_PROFILE_START(eq_start);
     for (size_t i = 0; i < DSP_HOP_SIZE; ++i)
         for (size_t filter = 0; filter < 5; ++filter)
-            output[i] = dsp_biquad_process(&state->filters[filter], output[i]);
+            output[i] = dsp_biquad_process_inline(
+                &state->filters[filter], output[i]);
     ROBOT_PROFILE_ADD(eq_seconds, eq_start);
 
     ROBOT_PROFILE_START(dynamics_start);
@@ -214,7 +215,7 @@ RobotState *robot_init(int sample_rate) {
     state->filters[1] = dsp_peak_eq(180.0f, sample_rate, 0.9f, 3.0f);
     state->filters[2] = dsp_peak_eq(900.0f, sample_rate, 1.2f, 4.0f);
     state->filters[3] = dsp_peak_eq(2200.0f, sample_rate, 1.0f, 5.0f);
-    state->filters[4] = dsp_lowpass(6500.0f, sample_rate);
+    state->filters[4] = dsp_lowpass(9500.0f, sample_rate);
     return state;
 }
 

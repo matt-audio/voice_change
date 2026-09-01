@@ -1,6 +1,7 @@
 #ifndef VC_ROBOT_MONSTER_DSP_H
 #define VC_ROBOT_MONSTER_DSP_H
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -92,16 +93,28 @@ typedef enum {
 
 void dsp_init(void);
 void dsp_fft(DspComplex *values, size_t size, int inverse);
+/* RFFT buffers hold size complex values; size is a power of two in [2, 2048]. */
+void dsp_rfft(DspComplex *values, size_t size);
+void dsp_irfft(DspComplex *values, size_t size);
 float dsp_hann(size_t index, size_t size);
 float dsp_sine_cycles(float cycles);
 /* Fast path after dsp_init(); cycles must stay within one wrap of [0, 1). */
 float dsp_sine_cycles_wrapped(float cycles);
+/* Read-only 1025-entry sine table; initialized before it is returned. */
+const float *dsp_sine_lut(void);
 const float *dsp_frame_hann(void);
 
 DspBiquad dsp_highpass(float frequency, int sample_rate);
 DspBiquad dsp_lowpass(float frequency, int sample_rate);
 DspBiquad dsp_peak_eq(float frequency, int sample_rate,
                      float q, float gain_db);
+static inline float dsp_biquad_process_inline(DspBiquad *filter,
+                                               float sample) {
+    float output = filter->b0 * sample + filter->z1;
+    filter->z1 = filter->b1 * sample - filter->a1 * output + filter->z2;
+    filter->z2 = filter->b2 * sample - filter->a2 * output;
+    return isfinite(output) ? output : 0.0f;
+}
 float dsp_biquad_process(DspBiquad *filter, float sample);
 float dsp_frame_rms(const float frame[DSP_FRAME_SIZE]);
 

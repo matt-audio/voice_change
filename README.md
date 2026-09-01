@@ -9,6 +9,17 @@ sample-rate conversion, filters, chorus, and dynamics. Robot and Monster use
 the project's own YIN, PSOLA, LPC, filters, and dynamics. No third-party audio
 library is required.
 
+The three pitched voices use a 24 kHz internal wideband path with a 1024-sample
+phase-vocoder frame, a 256-sample internal hop, and a 10 kHz anti-alias filter.
+This preserves transformed speech detail well above 4 kHz while the public
+realtime API remains 256 samples per call at 48 kHz. Robot and Monster retain
+their original realtime algorithms with wider output filtering; Monster stays
+deliberately darker than the other modes.
+
+The wideband path uses a packed real FFT, precomputed pitch-bin maps and FFT
+twiddles, and a symmetric 65-tap resampler. These keep its CPU time close to
+Monster without reducing the 24 kHz internal rate or phase-vocoder overlap.
+
 ## Build
 
 Requirements are a C11 compiler, `make`, and the platform C math library:

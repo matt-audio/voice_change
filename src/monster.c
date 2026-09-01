@@ -260,7 +260,7 @@ MonsterState *monster_init(int sample_rate, float target_hz) {
     state->filters[2] = dsp_peak_eq(110.0f, sample_rate, 0.9f, 5.0f);
     state->filters[3] = dsp_peak_eq(230.0f, sample_rate, 1.0f, -2.5f);
     state->filters[4] = dsp_peak_eq(900.0f, sample_rate, 1.0f, 2.0f);
-    state->filters[5] = dsp_lowpass(5600.0f, sample_rate);
+    state->filters[5] = dsp_lowpass(9000.0f, sample_rate);
     return state;
 }
 
@@ -304,7 +304,7 @@ int monster_process(MonsterState *state,
         float value = state->ola_weights[index] > 1e-5f
             ? state->ola[index] / state->ola_weights[index] : 0.0f;
         for (size_t filter = 0; filter < 6; ++filter)
-            value = dsp_biquad_process(&state->filters[filter], value);
+            value = dsp_biquad_process_inline(&state->filters[filter], value);
         float crushed = roundf(value * 4096.0f) / 4096.0f;
         value = value * 0.86f + crushed * 0.14f;
         output[i] = monster_dynamics_sample(state, value);

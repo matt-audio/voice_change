@@ -1,5 +1,6 @@
 #include "dsp.h"
 
+#include <assert.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@ static float g_frame_hann[DSP_FRAME_SIZE];
 static uint16_t g_fft_bit_reverse_512[DSP_YIN_FFT_SIZE];
 static uint16_t g_fft_bit_reverse_2048[DSP_LPC_FFT_SIZE];
 static DspComplex g_fft_steps[DSP_FFT_MAX_STAGES][2];
+static DspComplex g_fft_twiddles[DSP_LPC_FFT_SIZE / 2];
 static atomic_int g_tables_state;
 
 _Static_assert((DSP_PSOLA_RING_SIZE & (DSP_PSOLA_RING_SIZE - 1)) == 0,
@@ -81,6 +83,11 @@ void dsp_init(void) {
         }
         dsp_build_bit_reverse(g_fft_bit_reverse_512, DSP_YIN_FFT_SIZE);
         dsp_build_bit_reverse(g_fft_bit_reverse_2048, DSP_LPC_FFT_SIZE);
+        for (size_t i = 0; i < DSP_LPC_FFT_SIZE / 2; ++i) {
+            float angle = 2.0f * (float)M_PI * (float)i /
+                (float)DSP_LPC_FFT_SIZE;
+            g_fft_twiddles[i] = (DspComplex){cosf(angle), -sinf(angle)};
+        }
         size_t length = 2;
         for (size_t stage = 0; stage < DSP_FFT_MAX_STAGES; ++stage) {
             float angle = 2.0f * (float)M_PI / (float)length;
@@ -104,6 +111,11 @@ float dsp_sine_cycles_wrapped(float cycles) {
     if (cycles >= 1.0f) cycles -= 1.0f;
     else if (cycles < 0.0f) cycles += 1.0f;
     return dsp_sine_cycles_wrapped_ready(cycles);
+}
+
+const float *dsp_sine_lut(void) {
+    dsp_init();
+    return g_trig_lut;
 }
 
 float dsp_hann(size_t index, size_t size) {
@@ -139,6 +151,9 @@ static void dsp_fft_ready(DspComplex *values, size_t size, int inverse) {
     size_t stage = 0;
     for (size_t length = 2; length <= size; length <<= 1, ++stage) {
         size_t half = length >> 1;
+        int use_twiddle_table = length <= DSP_LPC_FFT_SIZE;
+        size_t twiddle_stride = use_twiddle_table
+            ? DSP_LPC_FFT_SIZE / length : 0;
         DspComplex step;
         if (stage < DSP_FFT_MAX_STAGES) {
             step = g_fft_steps[stage][inverse != 0];
@@ -150,6 +165,10 @@ static void dsp_fft_ready(DspComplex *values, size_t size, int inverse) {
         for (size_t start = 0; start < size; start += length) {
             DspComplex rotation = {1.0f, 0.0f};
             for (size_t j = 0; j < half; ++j) {
+                if (use_twiddle_table) {
+                    rotation = g_fft_twiddles[j * twiddle_stride];
+                    if (inverse) rotation.i = -rotation.i;
+                }
                 DspComplex even = values[start + j];
                 DspComplex odd = values[start + j + half];
                 DspComplex rotated = {
@@ -160,11 +179,13 @@ static void dsp_fft_ready(DspComplex *values, size_t size, int inverse) {
                     even.r + rotated.r, even.i + rotated.i};
                 values[start + j + half] = (DspComplex){
                     even.r - rotated.r, even.i - rotated.i};
-                DspComplex next = {
-                    rotation.r * step.r - rotation.i * step.i,
-                    rotation.r * step.i + rotation.i * step.r,
-                };
-                rotation = next;
+                if (!use_twiddle_table) {
+                    DspComplex next = {
+                        rotation.r * step.r - rotation.i * step.i,
+                        rotation.r * step.i + rotation.i * step.r,
+                    };
+                    rotation = next;
+                }
             }
         }
     }
@@ -180,6 +201,93 @@ static void dsp_fft_ready(DspComplex *values, size_t size, int inverse) {
 void dsp_fft(DspComplex *values, size_t size, int inverse) {
     dsp_init();
     dsp_fft_ready(values, size, inverse);
+}
+
+static DspComplex dsp_rfft_forward_bin(DspComplex a, DspComplex b,
+                                        float cycles) {
+    float sine = dsp_sine_cycles_ready(cycles);
+    float cosine = dsp_sine_cycles_ready(cycles + 0.25f);
+    float difference_r = a.r - b.r;
+    float difference_i = a.i - b.i;
+    return (DspComplex){
+        0.5f * (a.r + b.r + cosine * difference_i -
+                sine * difference_r),
+        0.5f * (a.i + b.i - cosine * difference_r -
+                sine * difference_i),
+    };
+}
+
+void dsp_rfft(DspComplex *values, size_t size) {
+    assert(values && size >= 2 && size <= DSP_LPC_FFT_SIZE &&
+           (size & (size - 1)) == 0);
+    dsp_init();
+    size_t half = size / 2;
+    for (size_t i = 0; i < half; ++i)
+        values[i] = (DspComplex){values[2 * i].r, values[2 * i + 1].r};
+    dsp_fft_ready(values, half, 0);
+
+    DspComplex zero = values[0];
+    values[0] = (DspComplex){zero.r + zero.i, 0.0f};
+    values[half] = (DspComplex){zero.r - zero.i, 0.0f};
+    for (size_t k = 1; k <= half / 2; ++k) {
+        size_t mirror = half - k;
+        DspComplex left = values[k];
+        DspComplex right = values[mirror];
+        values[k] = dsp_rfft_forward_bin(
+            left, (DspComplex){right.r, -right.i},
+            (float)k / (float)size);
+        if (mirror != k) {
+            values[mirror] = dsp_rfft_forward_bin(
+                right, (DspComplex){left.r, -left.i},
+                (float)mirror / (float)size);
+        }
+    }
+}
+
+static DspComplex dsp_rfft_inverse_bin(DspComplex a, DspComplex b,
+                                        float cycles) {
+    float sine = dsp_sine_cycles_ready(cycles);
+    float cosine = dsp_sine_cycles_ready(cycles + 0.25f);
+    float difference_r = a.r - b.r;
+    float difference_i = a.i - b.i;
+    float rotated_r = cosine * difference_r - sine * difference_i;
+    float rotated_i = cosine * difference_i + sine * difference_r;
+    return (DspComplex){
+        0.5f * (a.r + b.r - rotated_i),
+        0.5f * (a.i + b.i + rotated_r),
+    };
+}
+
+void dsp_irfft(DspComplex *values, size_t size) {
+    assert(values && size >= 2 && size <= DSP_LPC_FFT_SIZE &&
+           (size & (size - 1)) == 0);
+    dsp_init();
+    size_t half = size / 2;
+    DspComplex dc = values[0];
+    DspComplex nyquist = values[half];
+    values[0] = (DspComplex){
+        0.5f * (dc.r + nyquist.r),
+        0.5f * (dc.r - nyquist.r),
+    };
+    for (size_t k = 1; k <= half / 2; ++k) {
+        size_t mirror = half - k;
+        DspComplex left = values[k];
+        DspComplex right = values[mirror];
+        values[k] = dsp_rfft_inverse_bin(
+            left, (DspComplex){right.r, -right.i},
+            (float)k / (float)size);
+        if (mirror != k) {
+            values[mirror] = dsp_rfft_inverse_bin(
+                right, (DspComplex){left.r, -left.i},
+                (float)mirror / (float)size);
+        }
+    }
+    dsp_fft_ready(values, half, 1);
+    for (size_t i = half; i-- > 0;) {
+        DspComplex packed = values[i];
+        values[2 * i] = (DspComplex){packed.r, 0.0f};
+        values[2 * i + 1] = (DspComplex){packed.i, 0.0f};
+    }
 }
 
 static DspBiquad dsp_biquad_make(float b0, float b1, float b2,
@@ -221,10 +329,7 @@ DspBiquad dsp_peak_eq(float frequency, int sample_rate,
 }
 
 float dsp_biquad_process(DspBiquad *filter, float sample) {
-    float output = filter->b0 * sample + filter->z1;
-    filter->z1 = filter->b1 * sample - filter->a1 * output + filter->z2;
-    filter->z2 = filter->b2 * sample - filter->a2 * output;
-    return isfinite(output) ? output : 0.0f;
+    return dsp_biquad_process_inline(filter, sample);
 }
 
 float dsp_frame_rms(const float frame[DSP_FRAME_SIZE]) {

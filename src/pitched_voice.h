@@ -12,6 +12,8 @@
 typedef enum {
     PITCHED_VOICE_RATE_DEFAULT = 0,
     PITCHED_VOICE_RATE_FULL = 1,
+    PITCHED_VOICE_RATE_WIDEBAND = 2,
+    /* Legacy value retained for binary compatibility; uses wideband DSP. */
     PITCHED_VOICE_RATE_LOW_CPU = 6,
 } PitchedVoiceRate;
 
